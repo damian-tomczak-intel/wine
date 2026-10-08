@@ -65,20 +65,24 @@ static VkDevice get_host_device(VkDevice wine_device)
     return device->host.device;
 }
 
+/* Command buffers and device memory are private to winevulkan in this Wine
+ * version (struct wine_cmd_buffer / wine_device_memory), but both start with
+ * VULKAN_OBJECT_HEADER, so the host handle can be read from struct vulkan_object. */
 static VkCommandBuffer get_host_command_buffer(VkCommandBuffer wine_cmd_buffer)
 {
-    struct vulkan_command_buffer *cmd_buffer;
+    struct vulkan_client_object *client = (struct vulkan_client_object *)wine_cmd_buffer;
+    struct vulkan_object *obj;
     if (!wine_cmd_buffer) return NULL;
-    cmd_buffer = vulkan_command_buffer_from_handle(wine_cmd_buffer);
-    return cmd_buffer->host.command_buffer;
+    obj = (struct vulkan_object *)(UINT_PTR)client->unix_handle;
+    return (VkCommandBuffer)(UINT_PTR)obj->host_handle;
 }
 
 static VkDeviceMemory get_host_device_memory(VkDeviceMemory wine_device_memory)
 {
-    struct vulkan_device_memory *device_memory;
+    struct vulkan_object *obj;
     if (!wine_device_memory) return VK_NULL_HANDLE;
-    device_memory = vulkan_device_memory_from_handle(wine_device_memory);
-    return device_memory->host.device_memory;
+    obj = (struct vulkan_object *)(UINT_PTR)wine_device_memory;
+    return (VkDeviceMemory)obj->host_handle;
 }
 
 struct xess_context_init_params_entry
