@@ -245,14 +245,11 @@ struct xess_d3d12_state_tracker
     ID3D12Heap *temp_texture_heap;
     uint64_t buffer_heap_base_offset;
     uint64_t texture_heap_base_offset;
-    /* image view state */
-    struct list image_view_entries;
 };
 
 struct xess_d3d12_image_view_entry
 {
     struct list entry;
-    VkImage image;
     VkFormat format;
     VkImageAspectFlags aspect_mask;
     VkImageViewType view_type;
@@ -262,20 +259,159 @@ struct xess_d3d12_image_view_entry
     UINT reuse_count;
 };
 
+/* Image views created for one ID3D12Resource, attached to it as private data.
+ * The views are destroyed together with the resource, which D3D12 requires the
+ * application to keep alive while the GPU uses it. A new resource may get the
+ * VkImage handle of a destroyed one, so each resource has its own views. */
+struct xess_d3d12_resource_views
+{
+    IUnknown IUnknown_iface;
+    LONG refcount;
+    VkDevice vk_device;
+    VkImage image;
+    PFN_vkDestroyImageView pfn_vkDestroyImageView;
+    SRWLOCK lock;
+    struct list views;
+};
+
+/* {5b1e7d3a-2c4f-4e8b-9a61-0f3d8c2b7e45} */
+DEFINE_GUID(xess_d3d12_resource_views_guid, 0x5b1e7d3a, 0x2c4f, 0x4e8b, 0x9a, 0x61, 0x0f, 0x3d, 0x8c, 0x2b, 0x7e, 0x45);
+
+static inline struct xess_d3d12_resource_views *impl_from_IUnknown(IUnknown *iface)
+{
+    return CONTAINING_RECORD(iface, struct xess_d3d12_resource_views, IUnknown_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE xess_d3d12_resource_views_QueryInterface(IUnknown *iface, REFIID riid, void **out)
+{
+    if (IsEqualGUID(riid, &IID_IUnknown))
+    {
+        IUnknown_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE xess_d3d12_resource_views_AddRef(IUnknown *iface)
+{
+    return InterlockedIncrement(&impl_from_IUnknown(iface)->refcount);
+}
+
+static ULONG STDMETHODCALLTYPE xess_d3d12_resource_views_Release(IUnknown *iface)
+{
+    struct xess_d3d12_resource_views *views = impl_from_IUnknown(iface);
+    struct xess_d3d12_image_view_entry *view_entry, *view_entry_next;
+    ULONG refcount = InterlockedDecrement(&views->refcount);
+
+    if (refcount)
+        return refcount;
+
+    LIST_FOR_EACH_ENTRY_SAFE(view_entry, view_entry_next, &views->views, struct xess_d3d12_image_view_entry, entry)
+    {
+        TRACE("Destroying VkImageView %#I64x (image %#I64x), reused %u times.\n",
+            (UINT64)view_entry->image_view, (UINT64)views->image, view_entry->reuse_count);
+        list_remove(&view_entry->entry);
+        views->pfn_vkDestroyImageView(views->vk_device, view_entry->image_view, NULL);
+        free(view_entry);
+    }
+    free(views);
+    return 0;
+}
+
+static const IUnknownVtbl xess_d3d12_resource_views_vtbl =
+{
+    xess_d3d12_resource_views_QueryInterface,
+    xess_d3d12_resource_views_AddRef,
+    xess_d3d12_resource_views_Release,
+};
+
+/* Returns the views attached to the resource if they belong to the given VkImage.
+ * The caller owns a reference. */
+static struct xess_d3d12_resource_views *xess_d3d12_find_resource_views(ID3D12Resource *resource,
+    VkDevice vk_device, VkImage vk_image)
+{
+    struct xess_d3d12_resource_views *views;
+    IUnknown *unk = NULL;
+    UINT size = sizeof(unk);
+
+    if (FAILED(ID3D12Resource_GetPrivateData(resource, &xess_d3d12_resource_views_guid, &size, &unk)) || !unk)
+        return NULL;
+
+    views = impl_from_IUnknown(unk);
+    if (views->vk_device == vk_device && views->image == vk_image)
+        return views;
+
+    WARN("Resource %p changed VkImage %#I64x -> %#I64x, recreating its views.\n",
+        resource, (UINT64)views->image, (UINT64)vk_image);
+    IUnknown_Release(unk);
+    return NULL;
+}
+
+/* Creates views for the resource and attaches them to it. The caller owns a reference. */
+static struct xess_d3d12_resource_views *xess_d3d12_create_resource_views(ID3D12Resource *resource,
+    VkDevice vk_device, VkImage vk_image)
+{
+    struct xess_d3d12_resource_views *views;
+    HRESULT hr;
+
+    if (!(views = calloc(1, sizeof(*views))))
+        return NULL;
+    views->IUnknown_iface.lpVtbl = &xess_d3d12_resource_views_vtbl;
+    views->refcount = 1;
+    views->vk_device = vk_device;
+    views->image = vk_image;
+    views->pfn_vkDestroyImageView = (PFN_vkDestroyImageView)vkGetDeviceProcAddr(vk_device, "vkDestroyImageView");
+    InitializeSRWLock(&views->lock);
+    list_init(&views->views);
+
+    if (!views->pfn_vkDestroyImageView)
+    {
+        WARN("Unable to resolve vkDestroyImageView.\n");
+        free(views);
+        return NULL;
+    }
+
+    if (FAILED(hr = ID3D12Resource_SetPrivateDataInterface(resource, &xess_d3d12_resource_views_guid,
+        &views->IUnknown_iface)))
+    {
+        WARN("Failed to attach image views to resource %p: %#lx\n", resource, hr);
+        free(views);
+        return NULL;
+    }
+
+    return views;
+}
+
+/* Returns the views attached to the resource, creating them on first use.
+ * The caller owns a reference. */
+static struct xess_d3d12_resource_views *xess_d3d12_get_resource_views(ID3D12Resource *resource,
+    VkDevice vk_device, VkImage vk_image)
+{
+    static SRWLOCK attach_lock = SRWLOCK_INIT;
+    struct xess_d3d12_resource_views *views;
+
+    AcquireSRWLockExclusive(&attach_lock);
+    if (!(views = xess_d3d12_find_resource_views(resource, vk_device, vk_image)))
+        views = xess_d3d12_create_resource_views(resource, vk_device, vk_image);
+    ReleaseSRWLockExclusive(&attach_lock);
+
+    return views;
+}
+
 static struct list xess_d3d12_state_trackers = LIST_INIT(xess_d3d12_state_trackers);
 
 static void xess_d3d12_release_state_tracker(struct xess_d3d12_state_tracker *entry)
 {
     PFN_vkDeviceWaitIdle pfn_vkDeviceWaitIdle;
-    PFN_vkDestroyImageView pfn_vkDestroyImageView;
     PFN_vkDestroyPipelineCache pfn_vkDestroyPipelineCache;
-    struct xess_d3d12_image_view_entry *view_entry, *view_entry_next;
     VkResult vk_result;
 
     TRACE("Releasing state tracker for context %p\n", entry->context);
 
-    if (entry->vk_device &&
-        (!list_empty(&entry->image_view_entries) || entry->pipeline_cache != VK_NULL_HANDLE))
+    if (entry->vk_device && entry->pipeline_cache != VK_NULL_HANDLE)
     {
         pfn_vkDeviceWaitIdle = (PFN_vkDeviceWaitIdle)vkGetDeviceProcAddr(entry->vk_device, "vkDeviceWaitIdle");
         if (pfn_vkDeviceWaitIdle)
@@ -283,29 +419,6 @@ static void xess_d3d12_release_state_tracker(struct xess_d3d12_state_tracker *en
             vk_result = pfn_vkDeviceWaitIdle(entry->vk_device);
             if (vk_result != VK_SUCCESS)
                 WARN("vkDeviceWaitIdle failed while releasing context %p: %d\n", entry->context, vk_result);
-        }
-    }
-
-    if (!list_empty(&entry->image_view_entries))
-    {
-        TRACE("Releasing %u cached image views for context %p\n", list_count(&entry->image_view_entries), entry->context);
-        pfn_vkDestroyImageView = (PFN_vkDestroyImageView)vkGetDeviceProcAddr(entry->vk_device, "vkDestroyImageView");
-        if (!pfn_vkDestroyImageView)
-        {
-            WARN("Unable to resolve vkDestroyImageView for %p, leaking %u cached image views.\n", entry->context,
-                list_count(&entry->image_view_entries));
-        }
-        else
-        {
-            LIST_FOR_EACH_ENTRY_SAFE(view_entry, view_entry_next, &entry->image_view_entries,
-                struct xess_d3d12_image_view_entry, entry)
-            {
-                TRACE("Destroying VkImageView %#I64x (image %#I64x), reused %u times.\n",
-                    (UINT64)view_entry->image_view, (UINT64)view_entry->image, view_entry->reuse_count);
-                list_remove(&view_entry->entry);
-                pfn_vkDestroyImageView(entry->vk_device, view_entry->image_view, NULL);
-                free(view_entry);
-            }
         }
     }
 
@@ -335,7 +448,6 @@ static void xess_d3d12_release_state_tracker(struct xess_d3d12_state_tracker *en
     }
     entry->buffer_heap_base_offset = 0;
     entry->texture_heap_base_offset = 0;
-    list_init(&entry->image_view_entries);
 
     if (entry->d3d12_device)
     {
@@ -357,60 +469,35 @@ static struct xess_d3d12_state_tracker *xess_d3d12_find_state_tracker(xess_conte
     return NULL;
 }
 
-static VkImageView xess_d3d12_get_or_create_image_view(xess_context_handle_t hContext,
-    VkDevice vk_device, PFN_vkCreateImageView pfn_vkCreateImageView,
-    VkImage vk_image, VkFormat format, const D3D12_RESOURCE_DESC *desc,
-    VkImageAspectFlags aspect_mask, UINT mip_level_count)
+/* Must be called with views->lock held. */
+static VkImageView xess_d3d12_resource_views_get_or_create(struct xess_d3d12_resource_views *views,
+    ID3D12Resource *resource, PFN_vkCreateImageView pfn_vkCreateImageView,
+    VkFormat format, const D3D12_RESOURCE_DESC *desc, VkImageAspectFlags aspect_mask,
+    UINT mip_level_count, VkImageViewType view_type, UINT layer_count)
 {
-    bool disable_cache;
-    struct xess_d3d12_state_tracker *state_entry;
     struct xess_d3d12_image_view_entry *cache_entry;
-    VkImageViewType view_type;
-    UINT layer_count;
     VkImageView image_view;
 
-    state_entry = xess_d3d12_find_state_tracker(hContext);
-    if (!state_entry)
+    LIST_FOR_EACH_ENTRY(cache_entry, &views->views, struct xess_d3d12_image_view_entry, entry)
     {
-        WARN("No state tracker found for context %p when creating image view.\n", hContext);
-        return VK_NULL_HANDLE;
-    }
-
-    view_type = get_vk_image_view_type_from_desc(desc);
-    layer_count = (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : desc->DepthOrArraySize;
-
-    disable_cache = xess_disable_image_view_cache_enabled();
-
-    if (!disable_cache)
-    {
-        LIST_FOR_EACH_ENTRY(cache_entry, &state_entry->image_view_entries, struct xess_d3d12_image_view_entry, entry)
+        if (cache_entry->format == format &&
+            cache_entry->aspect_mask == aspect_mask &&
+            cache_entry->view_type == view_type &&
+            cache_entry->mip_level_count == mip_level_count &&
+            cache_entry->layer_count == layer_count)
         {
-            if (cache_entry->image == vk_image &&
-                cache_entry->format == format &&
-                cache_entry->aspect_mask == aspect_mask &&
-                cache_entry->view_type == view_type &&
-                cache_entry->mip_level_count == mip_level_count &&
-                cache_entry->layer_count == layer_count)
-            {
-                cache_entry->reuse_count++;
-                if (cache_entry->reuse_count == 1)
-                    TRACE("Reusing cached VkImageView %#I64x for image %#I64x (format %u).\n",
-                        (UINT64)cache_entry->image_view, (UINT64)cache_entry->image, cache_entry->format);
-                return cache_entry->image_view;
-            }
+            cache_entry->reuse_count++;
+            if (cache_entry->reuse_count == 1)
+                TRACE("Reusing cached VkImageView %#I64x for resource %p, image %#I64x (format %u).\n",
+                    (UINT64)cache_entry->image_view, resource, (UINT64)views->image, cache_entry->format);
+            return cache_entry->image_view;
         }
     }
 
-    image_view = get_vk_image_view(vk_device, pfn_vkCreateImageView, vk_image, format, desc, aspect_mask, mip_level_count);
+    image_view = get_vk_image_view(views->vk_device, pfn_vkCreateImageView, views->image, format, desc,
+        aspect_mask, mip_level_count);
     if (image_view == VK_NULL_HANDLE)
         return VK_NULL_HANDLE;
-
-    if (disable_cache)
-    {
-        TRACE("PROTON_XESS_DISABLE_IMAGE_VIEW_CACHE=1 created uncached VkImageView %#I64x for image %#I64x (format %u, mips %u, layers %u).\n",
-            (UINT64)image_view, (UINT64)vk_image, format, mip_level_count, layer_count);
-        return image_view;
-    }
 
     if (!(cache_entry = calloc(1, sizeof(*cache_entry))))
     {
@@ -418,7 +505,6 @@ static VkImageView xess_d3d12_get_or_create_image_view(xess_context_handle_t hCo
         return image_view;
     }
 
-    cache_entry->image = vk_image;
     cache_entry->format = format;
     cache_entry->aspect_mask = aspect_mask;
     cache_entry->view_type = view_type;
@@ -426,10 +512,44 @@ static VkImageView xess_d3d12_get_or_create_image_view(xess_context_handle_t hCo
     cache_entry->layer_count = layer_count;
     cache_entry->image_view = image_view;
     cache_entry->reuse_count = 0;
-    list_add_tail(&state_entry->image_view_entries, &cache_entry->entry);
-    TRACE("Cached new VkImageView %#I64x for image %#I64x (format %u, mips %u, layers %u).\n",
-        (UINT64)cache_entry->image_view, (UINT64)cache_entry->image, cache_entry->format,
-        cache_entry->mip_level_count, cache_entry->layer_count);
+    list_add_tail(&views->views, &cache_entry->entry);
+    TRACE("Cached new VkImageView %#I64x for resource %p, image %#I64x (format %u, mips %u, layers %u).\n",
+        (UINT64)image_view, resource, (UINT64)views->image, format, mip_level_count, layer_count);
+    return image_view;
+}
+
+static VkImageView xess_d3d12_get_or_create_image_view(ID3D12Resource *resource,
+    VkDevice vk_device, PFN_vkCreateImageView pfn_vkCreateImageView,
+    VkImage vk_image, VkFormat format, const D3D12_RESOURCE_DESC *desc,
+    VkImageAspectFlags aspect_mask, UINT mip_level_count)
+{
+    struct xess_d3d12_resource_views *views;
+    VkImageViewType view_type;
+    UINT layer_count;
+    VkImageView image_view;
+
+    view_type = get_vk_image_view_type_from_desc(desc);
+    layer_count = (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : desc->DepthOrArraySize;
+
+    if (xess_disable_image_view_cache_enabled())
+    {
+        image_view = get_vk_image_view(vk_device, pfn_vkCreateImageView, vk_image, format, desc, aspect_mask, mip_level_count);
+        TRACE("PROTON_XESS_DISABLE_IMAGE_VIEW_CACHE=1 created uncached VkImageView %#I64x for image %#I64x (format %u, mips %u, layers %u).\n",
+            (UINT64)image_view, (UINT64)vk_image, format, mip_level_count, layer_count);
+        return image_view;
+    }
+
+    if (!(views = xess_d3d12_get_resource_views(resource, vk_device, vk_image)))
+    {
+        WARN("Failed to get image view cache for resource %p. Falling back to uncached VkImageView.\n", resource);
+        return get_vk_image_view(vk_device, pfn_vkCreateImageView, vk_image, format, desc, aspect_mask, mip_level_count);
+    }
+
+    AcquireSRWLockExclusive(&views->lock);
+    image_view = xess_d3d12_resource_views_get_or_create(views, resource, pfn_vkCreateImageView,
+        format, desc, aspect_mask, mip_level_count, view_type, layer_count);
+    ReleaseSRWLockExclusive(&views->lock);
+    IUnknown_Release(&views->IUnknown_iface);
     return image_view;
 }
 
@@ -593,7 +713,7 @@ static xess_result_t translate_texture_resource(
     pTextureInfo->subresourceRange.layerCount = (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 1 : desc.DepthOrArraySize;
 
     /* Create VkImageView */
-    pTextureInfo->imageView = xess_d3d12_get_or_create_image_view(hContext, vk_device, pfn_vkCreateImageView,
+    pTextureInfo->imageView = xess_d3d12_get_or_create_image_view(pTexture, vk_device, pfn_vkCreateImageView,
         pTextureInfo->image, pTextureInfo->format, &desc, aspect_mask, mip_level_count);
     if (pTextureInfo->imageView == VK_NULL_HANDLE)
     {
@@ -626,7 +746,6 @@ static BOOL xess_d3d12_create_state_tracker(xess_context_handle_t hContext, VkDe
             return FALSE;
 
         entry->context = hContext;
-        list_init(&entry->image_view_entries);
         list_add_tail(&xess_d3d12_state_trackers, &entry->entry);
     }
 
@@ -706,7 +825,6 @@ static BOOL xess_d3d12_track_state_heaps(xess_context_handle_t hContext,
         }
 
         entry->context = hContext;
-        list_init(&entry->image_view_entries);
         list_add_tail(&xess_d3d12_state_trackers, &entry->entry);
     }
     else
